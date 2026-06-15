@@ -135,11 +135,11 @@ Example:
 }
 ```
 
-Servers that support the `"plans"` extension MUST support CEL (`"cel"`) as an expression
-language. Servers MAY additionally advertise `"sandbox"` to indicate support for inline
-sandboxed JavaScript expressions.
-
-Users of JSONata MAY negotiate it as an alternate expression language (see Section 3).
+The `expression_languages` array advertises the expression languages the server
+supports for plan condition evaluation. By default, this MUST only include `"cel"`
+(which is mandatory for plan-supporting servers). The `"sandbox"` identifier
+MUST NOT appear in this array — clients request it during negotiation as an
+opt-in upgrade (see Section 2a.3).
 
 ---
 
@@ -158,12 +158,21 @@ Servers MAY also support JSONata as an expression language. Clients that prefer
 JSONata SHALL indicate this during negotiation (Section 3). If a server does not
 support the requested expression language, the client MUST fall back to CEL.
 
-### 2a.3 Sandbox (Optional)
+### 2a.3 Sandboxed JavaScript (Opt-in Upgrade)
 
-Servers MAY advertise `"sandbox"` as an expression type. When sandbox is active,
-condition expressions and inline operations MAY contain small, sandboxed JavaScript
-snippets executed in an isolated environment. The sandbox environment exposes
-a predefined set of variables:
+The sandbox is an **opt-in upgrade** over CEL. Servers MUST NOT advertise `"sandbox"`
+in their capability document by default — a client may only use sandboxed JavaScript
+if both sides have explicitly agreed to it through the following protocol:
+
+1. The client requests `"sandbox"` as its `expression_language` during negotiation.
+2. The server confirms `"sandbox"` in the negotiation response **and** activates
+   the sandbox isolation layer.
+3. If the server does not support sandbox, it responds with a mutually supported
+   expression language (typically `"cel"` instead).
+
+When sandbox is active, condition expressions and inline operations MAY contain
+small, sandboxed JavaScript snippets executed in an isolated environment. The
+sandbox environment exposes a predefined set of variables:
 
 | Variable            | Description                                  |
 |---------------------|----------------------------------------------|
@@ -175,6 +184,17 @@ a predefined set of variables:
 Implementations MUST enforce execution timeouts, recursion limits, and memory
 bounds on sandbox execution. The sandbox MUST NOT have access to: filesystem,
 network sockets, environment variables, or system processes.
+
+### 2a.4 Negotiation Priority
+
+When a plan step has a `kind` of `"conditional"`, the executor SHALL use
+the expression language negotiated at connection time (see Section 3).
+
+| Expression Language | Negotiation | Server Requirement           |
+|---------------------|-------------|------------------------------|
+| CEL                 | Default     | MUST support if plans active |
+| JSONata             | Client-initiated opt-in | MAY support |
+| Sandboxed JS        | Client-initiated opt-in | MUST NOT advertise; client MUST explicitly request |
 
 ---
 

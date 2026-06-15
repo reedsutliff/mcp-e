@@ -819,6 +819,10 @@ export enum ExpressionLanguage {
   /** JSONata query/expression language — opt-in. */
   JSONATA = "jsonata",
 
-  /** Sandboxed JavaScript — optional, requires isolation guarantees. */
+  /**
+   * Sandboxed JavaScript — opt-in upgrade only.
+   * Servers MUST NOT advertise this in capability documents.
+   * Clients MUST explicitly request it during negotiation.
+   */
   SANDBOX = "sandbox",
 }

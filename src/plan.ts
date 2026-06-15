@@ -1320,6 +1320,11 @@ export class ExpressionEvaluator {
   /**
    * Evaluate an expression in the sandbox.
    *
+   * **This is an opt-in upgrade only.** It MUST NOT activate unless the
+   * client explicitly requested `"sandbox"` during negotiation and the
+   * server confirmed it. Servers MUST NOT fall back to sandbox — if
+   * sandbox was not negotiated, use CEL instead.
+   *
    * Provides `plan.step[n]`, `plan.step[id]`, `plan.variables`,
    * and `plan.input` as predefined bindings.
    *

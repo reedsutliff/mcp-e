@@ -307,7 +307,7 @@ export class NegotiateHandler {
     // Expression language: single selection with CEL fallback
     const expressionLanguage = this.selectExpressionLanguage(
       params.expression_language,
-      this.options.supportedExpressionLanguages ?? ["cel"]
+      this.options.supportedExpressionLanguages ?? []
     );
 
     // If any required selection fails, return an error
