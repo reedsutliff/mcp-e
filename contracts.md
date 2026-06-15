@@ -753,9 +753,11 @@ CLOSED → CONNECTING
 | Extension          | Initiator | Required fields               | Response shape                              | Failure modes                             |
 |--------------------|-----------|-------------------------------|---------------------------------------------|-------------------------------------------|
 | Discovery          | Client    | `mcp_version`, `endpoints`    | JSON doc                                    | 404/5xx/timeout → fallback                |
-| Capability Disc.   | Client    | (none required, all optional) | JSON doc                                    | 404 → baseline; 5xx → baseline            |
-| Negotiation        | Client    | Params optional; result all 3 | `NegotiateResult` or JSON-RPC error         | -32601 → defaults; invalid params → retry |
+| Capability Disc.   | Client    | (none required, all optional) | JSON doc with `expression_languages`        | 404 → baseline; 5xx → baseline            |
+| Negotiation        | Client    | Params optional; result: v5 fields | `NegotiateResult` (including `extensions`, `expression_language`) | -32601 → defaults; no intersection → defaults |
 | Auth Discovery     | Client    | `type` within each entry      | Embedded in discovery doc                   | No compatible type → disconnect            |
-| Execution Plans    | Client/Server | `type`, `version`, `steps` | Plan object (serialized JSON)               | Invalid schema → validation error         |
+| Execution Plans    | Client/Server | `kind`, `type`, `version`, `steps` | Plan object (serialized JSON)               | Invalid schema → validation error         |
 | Tool Metadata      | Server    | (none, all optional)          | Extended tool definition                    | Missing → pessimistic defaults             |
-| Structured Errors  | Server    | `code`                        | Structured error in JSON-RPC `data` field   | Missing code → treated as generic error   |
+| Structured Errors  | Server    | `code` (9 standard codes)     | `data` field (inline) or `mcp.error` (async) | Missing code → treated as generic error   |
+| Human Approval     | Client    | `plan_id`, `step_id`, `authorized_by` | JSON-RPC `mcp.approve`/`mcp.deny`    | Timeout → denial; rejection → `APPROVAL_DENIED` |
+| Expression Eval    | Client/Server | CEL default, negotiated per session | Boolean from condition evaluation       | Unsupported language → fallback to CEL     |

@@ -3,6 +3,17 @@
 **Spec version:** 0.1.0 (Draft)
 **Review date:** 2026-06-15
 
+Updates applied in [`decisions` branch](https://github.com/reedsutliff/mcp-e/tree/decisions):
+
+| # | Question | Resolution |
+|---|---|---|
+| 1 | Step type discriminator | Added `kind` field: `tool_call`, `operation`, `foreach`, `parallel`, `conditional` |
+| 2 | Condition expression language | CEL mandatory (section 2a), JSONata opt-in, sandbox optional, all negotiated |
+| 3 | Structured error delivery | Inline via JSON-RPC `data`; async via `mcp.error` method |
+| 4 | Human approval response | JSON-RPC `mcp.approve`/`mcp.deny` with `authorized_by` (human/policy/yolo) |
+| 5 | Extension negotiation | Folded into `mcp.negotiate` params/result alongside version/encoding/compression |
+| 6 | Expression language discovery | Advertised in capability document `expression_languages` field |
+
 ---
 
 ## Table of Contents
