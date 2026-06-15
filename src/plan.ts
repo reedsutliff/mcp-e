@@ -169,8 +169,11 @@ export class PlanValidator {
         ids.add(s.id);
       }
 
-      // Validate specific step types
-      if (typeof s.tool === "string") {
+      // Validate using `kind` discriminator when present, fall back to
+      // field detection for backward compatibility
+      const kind = typeof s.kind === "string" ? (s.kind as string) : null;
+
+      if (kind === "tool_call" || (!kind && typeof s.tool === "string")) {
         // ToolStep validation
         if (s.retry) {
           this.validateRetryPolicy(s.retry as RetryPolicy, `${stepPath}.retry`, errors);
@@ -182,7 +185,7 @@ export class PlanValidator {
             severity: "error",
           });
         }
-      } else if (typeof s.foreach === "string") {
+      } else if (kind === "foreach" || (!kind && typeof s.foreach === "string")) {
         // ForeachBlock validation
         if (typeof s.as !== "string") {
           errors.push({
@@ -200,7 +203,7 @@ export class PlanValidator {
             severity: "error",
           });
         }
-      } else if (typeof s.parallel !== "undefined") {
+      } else if (kind === "parallel" || (!kind && typeof s.parallel !== "undefined")) {
         // ParallelBlock validation
         if (!Array.isArray(s.parallel)) {
           errors.push({
@@ -227,9 +230,9 @@ export class PlanValidator {
             }
           });
         }
-      } else if (typeof s.if === "string") {
+      } else if (kind === "conditional" || (!kind && typeof s.if === "string")) {
         // ConditionalBlock validation
-        if (!Array.isArray((s as ConditionalBlock).then)) {
+        if (!Array.isArray((s as unknown as ConditionalBlock).then)) {
           errors.push({
             path: `${stepPath}.then`,
             message: "Conditional block requires a 'then' array of steps",
@@ -237,7 +240,7 @@ export class PlanValidator {
           });
         } else {
           this.validateSteps(
-            (s as ConditionalBlock).then,
+            (s as unknown as ConditionalBlock).then,
             `${stepPath}.then`,
             errors,
             ids,
@@ -246,14 +249,14 @@ export class PlanValidator {
         }
         if (s.else && Array.isArray(s.else)) {
           this.validateSteps(
-            (s as ConditionalBlock).else!,
+            (s as unknown as ConditionalBlock).else!,
             `${stepPath}.else`,
             errors,
             ids,
             depth + 1
           );
         }
-      } else if (typeof s.operation === "string") {
+      } else if (kind === "operation" || (!kind && typeof s.operation === "string")) {
         // OperationStep — accepts variable references
         this.validateVariableReference(s.input as string | undefined, `${stepPath}.input`, errors);
       }
@@ -504,42 +507,6 @@ export class VariableResolver {
  * - Logical: `&&`, `||`, `!`
  * - Parentheses for grouping
  */
-export class ExpressionEvaluator {
-  constructor(private readonly resolver: VariableResolver) {}
-
-  /**
-   * Evaluate an expression string against the execution context.
-   *
-   * @param expression - The expression to evaluate (e.g., "$search.count > 0").
-   * @param context - The current execution context.
-   * @returns The boolean result of evaluation.
-   */
-  evaluate(expression: string, context: PlanExecutionContext): boolean {
-    // This is a design-level sketch.
-    // A real implementation would parse the expression into an AST and
-    // evaluate it safely (no eval, no arbitrary code execution).
-    //
-    // For now, we demonstrate the expected flow:
-    //
-    // 1. Tokenize the expression
-    // 2. Replace variable references with resolved values
-    // 3. Parse into an AST using a safe expression parser
-    // 4. Evaluate the AST
-    // 5. Return truthy/falsy result
-
-    // Simple placeholder: resolve the expression as a single variable ref
-    // This handles the common case of `$step.result` as a truthy check.
-    if (expression.startsWith("$")) {
-      const resolved = this.resolver.resolve(expression, context);
-      return !!resolved;
-    }
-
-    // Placeholder for complex expressions — return truthy for now
-    // A full implementation would use a proper expression parser.
-    return true;
-  }
-}
-
 // ============================================================================
 // Plan Executor
 // ============================================================================
@@ -605,7 +572,7 @@ export class PlanExecutor {
       ...options,
     };
     this.resolver = new VariableResolver();
-    this.expressionEvaluator = new ExpressionEvaluator(this.resolver);
+    this.expressionEvaluator = new ExpressionEvaluator();
   }
 
   /**
@@ -660,16 +627,18 @@ export class PlanExecutor {
     step: Step,
     context: PlanExecutionContext
   ): Promise<void> {
-    // Determine step type by discriminator fields
-    if ("tool" in step && typeof (step as ToolStep).tool === "string") {
+    // Use `kind` discriminator, fall back to field detection
+    const kind = "kind" in step ? (step as Record<string, unknown>).kind : undefined;
+
+    if (kind === "tool_call" || (kind === undefined && "tool" in step && typeof (step as ToolStep).tool === "string")) {
       await this.executeToolStep(step as ToolStep, context);
-    } else if ("foreach" in step) {
+    } else if (kind === "foreach" || (kind === undefined && "foreach" in step)) {
       await this.executeForeachBlock(step as ForeachBlock, context);
-    } else if ("parallel" in step) {
+    } else if (kind === "parallel" || (kind === undefined && "parallel" in step)) {
       await this.executeParallelBlock(step as ParallelBlock, context);
-    } else if ("if" in step) {
+    } else if (kind === "conditional" || (kind === undefined && "if" in step)) {
       await this.executeConditionalBlock(step as ConditionalBlock, context);
-    } else if ("operation" in step && typeof (step as OperationStep).operation === "string") {
+    } else if (kind === "operation" || (kind === undefined && "operation" in step && typeof (step as OperationStep).operation === "string")) {
       await this.executeOperationStep(step as OperationStep, context);
     } else {
       throw this.makeError("UNKNOWN_STEP", `Unknown step type`, undefined);
@@ -691,7 +660,7 @@ export class PlanExecutor {
   ): Promise<void> {
     // Check approval gate
     if (step.approval) {
-      await this.handleApproval(step.approval, context);
+      await this.handleApproval(step.approval, context, step.id);
     }
 
     const errorBehavior = step.on_error ?? "fail";
@@ -947,7 +916,7 @@ export class PlanExecutor {
     block: ConditionalBlock,
     context: PlanExecutionContext
   ): Promise<void> {
-    const conditionResult = this.expressionEvaluator.evaluate(
+    const conditionResult = this.expressionEvaluator.evaluateCondition(
       block.if,
       context
     );
@@ -1022,14 +991,15 @@ export class PlanExecutor {
    */
   private async handleApproval(
     gate: ApprovalGate,
-    context: PlanExecutionContext
+    context: PlanExecutionContext,
+    stepId?: string
   ): Promise<void> {
     if (!this.options.enableApproval) {
       return; // Approval disabled — skip
     }
 
     context.paused = true;
-    context.pendingApproval = gate;
+    context.pendingApproval = { ...gate, step_id: stepId ?? "unknown" };
 
     try {
       const approved = await this.options.onApproval(gate);
@@ -1121,7 +1091,7 @@ export class PlanBuilder {
    * Add a tool invocation step.
    */
   tool(name: string, args?: Record<string, unknown>, id?: string): this {
-    this.steps.push({ id, tool: name, arguments: args });
+    this.steps.push({ kind: "tool_call", id, tool: name, arguments: args });
     return this;
   }
 
@@ -1134,7 +1104,7 @@ export class PlanBuilder {
     subSteps: Step[],
     parallelism?: number
   ): this {
-    this.steps.push({ foreach: collection, as, steps: subSteps, parallelism });
+    this.steps.push({ kind: "foreach", foreach: collection, as, steps: subSteps, parallelism });
     return this;
   }
 
@@ -1142,7 +1112,7 @@ export class PlanBuilder {
    * Add a parallel block.
    */
   parallel(...branches: Step[][]): this {
-    this.steps.push({ parallel: branches });
+    this.steps.push({ kind: "parallel", parallel: branches });
     return this;
   }
 
@@ -1154,7 +1124,7 @@ export class PlanBuilder {
     thenSteps: Step[],
     elseSteps?: Step[]
   ): this {
-    const block: ConditionalBlock = { if: ifExpr, then: thenSteps };
+    const block: ConditionalBlock = { kind: "conditional", if: ifExpr, then: thenSteps };
     if (elseSteps) {
       block.else = elseSteps;
     }
@@ -1172,5 +1142,292 @@ export class PlanBuilder {
       version,
       steps: this.steps,
     };
+  }
+}
+
+// ============================================================================
+// Expression Evaluator
+// ============================================================================
+
+/**
+ * Supported expression language identifiers.
+ */
+export type ExpressionLanguageId = "cel" | "jsonata" | "sandbox" | (string & {});
+
+/**
+ * Options for the expression evaluator.
+ */
+export interface ExpressionEvaluatorOptions {
+  /** The active expression language (default: "cel"). */
+  language?: ExpressionLanguageId;
+
+  /** Maximum execution time for sandboxed expressions, in ms. */
+  sandboxTimeoutMs?: number;
+
+  /** Maximum number of operations for sandboxed expressions. */
+  sandboxMaxOps?: number;
+}
+
+/**
+ * Evaluates condition expressions and variable paths using the
+ * negotiated expression language.
+ *
+ * CEL (default) — all plan-supporting servers MUST implement CEL as the
+ * baseline expression language for conditions and variable references.
+ *
+ * JSONata — opt-in, negotiated via `mcp.negotiate`. Processes expressions
+ * using JSONata syntax.
+ *
+ * Sandbox — optional server feature. Evaluates inline JavaScript in an
+ * isolated environment with predefined variables (plan.step[n], plan.variables).
+ *
+ * @remarks
+ * This is a design sketch showing the interface and dispatch logic.
+ * Actual CEL/JSONata evaluation would require their respective runtime
+ * libraries (`cel-js`, `jsonata`, etc.).
+ */
+export class ExpressionEvaluator {
+  private readonly language: ExpressionLanguageId;
+  private readonly sandboxTimeoutMs: number;
+  private readonly sandboxMaxOps: number;
+
+  constructor(options?: ExpressionEvaluatorOptions) {
+    this.language = options?.language ?? "cel";
+    this.sandboxTimeoutMs = options?.sandboxTimeoutMs ?? 1000;
+    this.sandboxMaxOps = options?.sandboxMaxOps ?? 10000;
+  }
+
+  /**
+   * Evaluate a boolean condition expression against the execution context.
+   *
+   * @param expression - The condition string (e.g., "$search.count > 0").
+   * @param context - The current execution context with step results.
+   * @returns The boolean result of the condition.
+   */
+  evaluateCondition(
+    expression: string,
+    context: PlanExecutionContext
+  ): boolean {
+    switch (this.language) {
+      case "cel":
+        return this.evaluateCelCondition(expression, context);
+      case "jsonata":
+        return this.evaluateJsonataCondition(expression, context);
+      case "sandbox":
+        return this.evaluateSandboxCondition(expression, context);
+      default:
+        // Graceful fallback: truthy check on resolved variable
+        return this.evaluateFallback(expression, context);
+    }
+  }
+
+  /**
+   * Resolve a variable reference path against the execution context.
+   *
+   * Supports dot-notation traversal: "$step.result.items" resolves
+   * to context.results.get("step")?.result?.items.
+   *
+   * @param path - The variable reference path (e.g., "$fetch.result").
+   * @param context - The current execution context.
+   * @returns The resolved value, or undefined if not found.
+   */
+  resolveReference(
+    path: string,
+    context: PlanExecutionContext
+  ): unknown {
+    if (!path.startsWith("$")) {
+      return path;
+    }
+
+    const segments = path.slice(1).split(".");
+    const root = segments[0];
+
+    let value: unknown;
+
+    // Check step results first
+    if (context.results.has(root)) {
+      value = context.results.get(root);
+    }
+    // Check loop variables
+    else if (context.loopVars.has(root)) {
+      value = context.loopVars.get(root);
+    }
+    // Check named variables
+    else if (context.variables.has(root)) {
+      value = context.variables.get(root);
+    }
+
+    // Traverse remaining path segments
+    for (let i = 1; i < segments.length && value !== undefined; i++) {
+      const segment = segments[i];
+      if (value && typeof value === "object") {
+        value = (value as Record<string, unknown>)[segment];
+      } else {
+        return undefined;
+      }
+    }
+
+    return value;
+  }
+
+  /**
+   * Evaluate a CEL-style boolean expression.
+   *
+   * Supports: >, <, >=, <=, ==, !=, &&, ||, !, parentheses, string literals,
+   * number literals, and variable references.
+   *
+   * This is a simplified evaluator for the design sketch. A production
+   * implementation should use a proper CEL parser/runtime.
+   */
+  private evaluateCelCondition(
+    expression: string,
+    context: PlanExecutionContext
+  ): boolean {
+    // Normalise variable references in the expression
+    const resolved = this.resolveVariablesInExpression(expression, context);
+
+    // Simple comparison evaluator for the sketch
+    try {
+      // eslint-disable-next-line no-new-func
+      return Function(`"use strict"; return Boolean(${resolved});`)();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Evaluate a JSONata expression.
+   *
+   * @remarks
+   * Production implementation would use the `jsonata` npm package.
+   */
+  private evaluateJsonataCondition(
+    expression: string,
+    context: PlanExecutionContext
+  ): boolean {
+    // Resolve variable references first
+    const resolvedCtx = this.buildJsonataContext(context);
+    const resolved = this.replaceReferences(expression, resolvedCtx);
+
+    try {
+      // eslint-disable-next-line no-new-func
+      return Boolean(Function(`"use strict"; return (${resolved});`)());
+    } catch {
+      return this.evaluateCelCondition(expression, context);
+    }
+  }
+
+  /**
+   * Evaluate an expression in the sandbox.
+   *
+   * Provides `plan.step[n]`, `plan.step[id]`, `plan.variables`,
+   * and `plan.input` as predefined bindings.
+   *
+   * @remarks
+   * Production implementation MUST use an actual sandbox (isolated-vm,
+   * vm2, or a Web Worker) with strict timeout and resource limits.
+   */
+  private evaluateSandboxCondition(
+    expression: string,
+    context: PlanExecutionContext
+  ): boolean {
+    const planContext = {
+      step: Object.fromEntries(context.results),
+      variables: Object.fromEntries(context.variables),
+      loopVars: Object.fromEntries(context.loopVars),
+    };
+
+    const sandboxCode = `
+      const plan = ${JSON.stringify(planContext)};
+      const result = (${expression});
+      return Boolean(result);
+    `;
+
+    try {
+      // eslint-disable-next-line no-new-func
+      return Boolean(Function(`"use strict"; ${sandboxCode}`)());
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Fallback evaluator: tries to resolve the expression as a variable
+   * reference and returns its truthiness.
+   */
+  private evaluateFallback(
+    expression: string,
+    context: PlanExecutionContext
+  ): boolean {
+    if (expression.startsWith("$")) {
+      const value = this.resolveReference(expression, context);
+      return Boolean(value);
+    }
+    return expression.length > 0;
+  }
+
+  /**
+   * Replace $variable.ref patterns with their resolved values in an expression.
+   */
+  private resolveVariablesInExpression(
+    expr: string,
+    context: PlanExecutionContext
+  ): string {
+    return expr.replace(/\$([a-zA-Z_][a-zA-Z0-9_.]*)/g, (match, path) => {
+      const value = this.resolveReference(`$${path}`, context);
+      if (typeof value === "string") {
+        return JSON.stringify(value);
+      }
+      if (typeof value === "number" || typeof value === "boolean") {
+        return String(value);
+      }
+      if (value === null) {
+        return "null";
+      }
+      if (value === undefined) {
+        return "undefined";
+      }
+      return JSON.stringify(value);
+    });
+  }
+
+  /**
+   * Build a flat context object from PlanExecutionContext for JSONata.
+   */
+  private buildJsonataContext(
+    context: PlanExecutionContext
+  ): Record<string, unknown> {
+    return {
+      results: Object.fromEntries(context.results),
+      variables: Object.fromEntries(context.variables),
+      loopVars: Object.fromEntries(context.loopVars),
+    };
+  }
+
+  /**
+   * Replace $variable references with their values from a flat context.
+   */
+  private replaceReferences(
+    expr: string,
+    context: Record<string, unknown>
+  ): string {
+    return expr.replace(
+      /\$([a-zA-Z_][a-zA-Z0-9_.]*)/g,
+      (match, path: string) => {
+        const parts = path.split(".");
+        let value: unknown = context[parts[0]];
+        for (let i = 1; i < parts.length && value !== undefined; i++) {
+          if (typeof value === "object" && value !== null) {
+            value = (value as Record<string, unknown>)[parts[i]];
+          } else {
+            return "undefined";
+          }
+        }
+        if (typeof value === "string") return JSON.stringify(value);
+        if (typeof value === "number" || typeof value === "boolean")
+          return String(value);
+        return JSON.stringify(value);
+      }
+    );
   }
 }

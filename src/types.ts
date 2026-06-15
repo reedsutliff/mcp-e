@@ -55,6 +55,7 @@ export type AuthMechanism =
   | AuthNone
   | AuthBearer
   | AuthOAuth2
+  | AuthApiKey
   // Extensible via index: implementations MAY define custom auth types
   | { type: string; [key: string]: unknown };
 
@@ -78,6 +79,15 @@ export interface AuthOAuth2 {
   issuer: string;
   /** Requested OAuth scopes (e.g., ["mcp.read", "mcp.write"]). */
   scopes?: string[];
+}
+
+/** API key authentication. */
+export interface AuthApiKey {
+  type: "api_key";
+  /** Header name or query parameter to pass the key in. */
+  param_name?: string;
+  /** Where the key is expected: "header", "query", or "cookie". */
+  in?: "header" | "query" | "cookie";
 }
 
 /**
@@ -134,6 +144,13 @@ export interface McpCapabilitiesDocument {
 
   /** Extension identifiers supported (e.g., "plans", "subscriptions", "resumable"). */
   extensions?: string[];
+
+  /**
+   * Expression languages the server supports.
+   * Servers advertising "plans" MUST include "cel".
+   * Optional additions: "jsonata", "sandbox".
+   */
+  expression_languages?: string[];
 }
 
 // ============================================================================
@@ -143,8 +160,9 @@ export interface McpCapabilitiesDocument {
 /**
  * Parameters for the `mcp.negotiate` JSON-RPC method.
  *
- * The client offers its supported versions, encodings, and compression codecs.
- * The server selects one from each list.
+ * The client offers its supported versions, encodings, compression codecs,
+ * extensions, and preferred expression language. The server selects one
+ * from each offered list.
  */
 export interface NegotiateParams {
   /** Client-supported MCP protocol versions, in preference order (implied). */
@@ -155,11 +173,18 @@ export interface NegotiateParams {
 
   /** Client-supported compression codecs, in preference order (implied). */
   compression?: string[];
+
+  /** Requested extension identifiers to activate (e.g., ["plans", "subscriptions"]). */
+  extensions?: string[];
+
+  /** Preferred expression language identifier (e.g., "cel", "jsonata"). */
+  expression_language?: string;
 }
 
 /**
  * Result of a successful `mcp.negotiate` call.
- * The server picks a single value from each category.
+ * The server picks a single value from each category, constrained to the
+ * intersection of what the client offered and the server supports.
  */
 export interface NegotiateResult {
   /** Selected MCP protocol version. */
@@ -170,6 +195,12 @@ export interface NegotiateResult {
 
   /** Selected compression codec for the session. */
   compression: string;
+
+  /** Activated extension identifiers. */
+  extensions?: string[];
+
+  /** Selected expression language for conditional evaluation. */
+  expression_language?: string;
 }
 
 /** Default negotiation values when a server does not support negotiation. */
@@ -177,11 +208,29 @@ export const DEFAULT_NEGOTIATION: NegotiateResult = {
   version: "2025-03",
   encoding: "json",
   compression: "none",
+  extensions: [],
+  expression_language: "cel",
 } as const;
 
 // ============================================================================
 // 4. Execution Plans
 // ============================================================================
+
+// ---------------------------------------------------------------------------
+// Step kind discriminator
+// ---------------------------------------------------------------------------
+
+/**
+ * Discriminator for plan step types.
+ * Every plan step SHALL have a `kind` field from this enum.
+ */
+export enum StepKind {
+  TOOL_CALL = "tool_call",
+  OPERATION = "operation",
+  FOREACH = "foreach",
+  PARALLEL = "parallel",
+  CONDITIONAL = "conditional",
+}
 
 // ---------------------------------------------------------------------------
 // Plan container
@@ -190,7 +239,7 @@ export const DEFAULT_NEGOTIATION: NegotiateResult = {
 /**
  * A portable, deterministic representation of a multi-step operation.
  * Execution plans MUST be serializable as JSON and MUST NOT require
- * arbitrary code execution.
+ * arbitrary code execution (unless sandbox is negotiated).
  */
 export interface Plan {
   /** Discriminator — MUST equal "mcp.plan". */
@@ -204,17 +253,12 @@ export interface Plan {
 }
 
 // ---------------------------------------------------------------------------
-// Step types
+// Step types — discriminated union on `kind`
 // ---------------------------------------------------------------------------
 
 /**
  * Discriminated union of all step types.
- * The discriminator is implicit via the presence of specific fields:
- * - `tool` present + no `operation` → ToolStep
- * - `operation` present → OperationStep (regex, etc.)
- * - `foreach` present → ForeachBlock
- * - `parallel` present → ParallelBlock
- * - `if` present → ConditionalBlock
+ * The discriminator is the `kind` field — every step MUST set it.
  */
 export type Step =
   | ToolStep
@@ -232,6 +276,9 @@ export type Step =
  * Calls a named tool with optional arguments.
  */
 export interface ToolStep {
+  /** Step type discriminator — MUST equal "tool_call". */
+  kind: StepKind.TOOL_CALL;
+
   /** Optional identifier for result referencing via `$id.result`. */
   id?: string;
 
@@ -260,6 +307,9 @@ export interface ToolStep {
  * Currently only "regex" is specified, but the design is extensible.
  */
 export interface OperationStep {
+  /** Step type discriminator — MUST equal "operation". */
+  kind: StepKind.OPERATION;
+
   /** Optional identifier for result referencing. */
   id?: string;
 
@@ -293,6 +343,9 @@ export interface RegexOperationResult {
  * Enumerates a collection and executes sub-steps for each element.
  */
 export interface ForeachBlock {
+  /** Step type discriminator — MUST equal "foreach". */
+  kind: StepKind.FOREACH;
+
   /** Optional identifier for result referencing. */
   id?: string;
 
@@ -321,6 +374,9 @@ export interface ForeachBlock {
  * Executes multiple branch sequences simultaneously.
  */
 export interface ParallelBlock {
+  /** Step type discriminator — MUST equal "parallel". */
+  kind: StepKind.PARALLEL;
+
   /** Optional identifier for result referencing. */
   id?: string;
 
@@ -337,16 +393,20 @@ export interface ParallelBlock {
 
 /**
  * Conditional execution block.
- * Evaluates an expression and executes the appropriate branch.
+ * Evaluates an expression using the negotiated expression language
+ * (CEL by default) and executes the appropriate branch.
  */
 export interface ConditionalBlock {
+  /** Step type discriminator — MUST equal "conditional". */
+  kind: StepKind.CONDITIONAL;
+
   /** Optional identifier for result referencing. */
   id?: string;
 
   /**
    * Condition expression string.
-   * The expression language is implementation-defined per the spec.
-   * SHOULD be deterministic and side-effect free.
+   * Evaluated using the negotiated expression language (CEL by default;
+   * see Sections 2a and 3 of the spec).
    */
   if: string;
 
@@ -377,6 +437,18 @@ export interface RetryPolicy {
    * Implementations MAY support custom strategies.
    */
   backoff: "fixed" | "exponential" | string;
+
+  /** Initial backoff delay in milliseconds (default: 1000). */
+  initial_delay_ms?: number;
+
+  /** Maximum backoff delay in milliseconds (default: 60000). */
+  max_delay_ms?: number;
+
+  /** Backoff multiplier for exponential strategy (default: 2). */
+  multiplier?: number;
+
+  /** Apply jitter to backoff (default: true). */
+  jitter?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -401,11 +473,54 @@ export const DEFAULT_ERROR_BEHAVIOR: ErrorBehavior = "fail";
 
 /**
  * Human approval gate.
- * Pauses plan execution until a human approves or denies the operation.
+ * Pauses plan execution until a human or policy approves or denies.
  */
 export interface ApprovalGate {
   /** Message displayed to the human for context (e.g., "Send 37 emails?"). */
   message: string;
+
+  /** Timeout in milliseconds. If exceeded, treated as denial. */
+  timeout_ms?: number;
+}
+
+/**
+ * Source of an approval decision.
+ *
+ * - `"human"`: Explicit human consent (click, confirm, voice).
+ * - `"policy"`: Automated rule or policy (e.g., "auto-approve < 10 items").
+ * - `"yolo"`: Pre-configured blanket approval mode on the client.
+ */
+export type ApprovalAuthority = "human" | "policy" | "yolo";
+
+/**
+ * Parameters for the `mcp.approve` JSON-RPC method.
+ */
+export interface ApproveParams {
+  /** Plan identifier. */
+  plan_id: string;
+
+  /** Step identifier for the approval gate being responded to. */
+  step_id: string;
+
+  /** Source of the approval decision. */
+  authorized_by: ApprovalAuthority;
+}
+
+/**
+ * Parameters for the `mcp.deny` JSON-RPC method.
+ */
+export interface DenyParams {
+  /** Plan identifier. */
+  plan_id: string;
+
+  /** Step identifier for the approval gate being responded to. */
+  step_id: string;
+
+  /** Source of the denial decision. */
+  authorized_by: ApprovalAuthority;
+
+  /** Human-readable reason for denial. */
+  reason?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +545,7 @@ export interface PlanExecutionContext {
   paused: boolean;
 
   /** Current approval gate details, if paused. */
-  pendingApproval?: ApprovalGate;
+  pendingApproval?: ApprovalGate & { step_id: string };
 }
 
 /**
@@ -498,78 +613,90 @@ export interface PlanValidationError {
   /** Error message. */
   message: string;
 
-  /** Error severity. */
-  severity: "error" | "warning";
+  /**
+   * Severity of the validation issue.
+   * - "error": plan cannot be executed
+   * - "warning": advisory, plan may still execute
+   */
+  severity?: "error" | "warning";
 }
 
 /**
- * Computed metadata about a plan.
+ * Computed metadata about a plan after validation.
  */
 export interface PlanMetadata {
-  /** Total number of steps (recursive). */
+  /** Total number of steps (top-level + nested). */
   totalSteps: number;
 
-  /** Maximum nesting depth (foreach/parallel/conditional). */
-  maxDepth: number;
+  /** Maximum nesting depth of blocks. */
+  nestingDepth: number;
+
+  /** Number of tool invocation steps. */
+  toolCount: number;
+
+  /** Number of foreach blocks. */
+  foreachCount: number;
+
+  /** Number of parallel blocks. */
+  parallelCount: number;
+
+  /** Number of conditional blocks. */
+  conditionalCount: number;
 
   /** Number of approval gates. */
   approvalCount: number;
 
-  /** Whether the plan contains parallel execution. */
-  hasParallel: boolean;
-
-  /** Whether the plan contains foreach. */
-  hasForeach: boolean;
-
-  /** Whether the plan contains conditionals. */
-  hasConditionals: boolean;
-
-  /** Set of tool names used in the plan. */
-  toolsUsed: Set<string>;
+  /** Whether the plan contains any approval gates. */
+  requiresApproval: boolean;
 }
 
 // ============================================================================
-// 5. Tool Metadata
+// 7. Structured Errors
 // ============================================================================
 
 /**
- * Extended metadata for MCP tools.
- * These fields augment the standard MCP Tool definition to describe
- * execution characteristics.
+ * Well-known structured error codes.
+ * Servers MAY define additional codes beyond these.
  */
-export interface ToolMetadata {
-  /** Whether the tool causes external state changes. Default: true. */
-  side_effects?: boolean;
-
-  /** Whether the tool is safe to retry without side effects. Default: false. */
-  idempotent?: boolean;
-
-  /** Whether the tool should prompt for human confirmation. Default: false. */
-  requires_confirmation?: boolean;
-
-  /** Extensible: implementations MAY define additional metadata fields. */
-  [key: string]: unknown;
+export enum ErrorCode {
+  TOOL_NOT_FOUND = "TOOL_NOT_FOUND",
+  INVALID_ARGUMENTS = "INVALID_ARGUMENTS",
+  AUTH_REQUIRED = "AUTH_REQUIRED",
+  TOKEN_EXPIRED = "TOKEN_EXPIRED",
+  RATE_LIMITED = "RATE_LIMITED",
+  TIMEOUT = "TIMEOUT",
+  INTERNAL_ERROR = "INTERNAL_ERROR",
+  APPROVAL_DENIED = "APPROVAL_DENIED",
+  PLAN_VALIDATION_FAILED = "PLAN_VALIDATION_FAILED",
 }
 
-// ============================================================================
-// 6. Structured Errors
-// ============================================================================
+/**
+ * Retryability classification for standard error codes.
+ */
+export const ERROR_RETRYABILITY: Record<ErrorCode, boolean> = {
+  [ErrorCode.TOOL_NOT_FOUND]: false,
+  [ErrorCode.INVALID_ARGUMENTS]: false,
+  [ErrorCode.AUTH_REQUIRED]: false,
+  [ErrorCode.TOKEN_EXPIRED]: true,
+  [ErrorCode.RATE_LIMITED]: true,
+  [ErrorCode.TIMEOUT]: true,
+  [ErrorCode.INTERNAL_ERROR]: false,
+  [ErrorCode.APPROVAL_DENIED]: false,
+  [ErrorCode.PLAN_VALIDATION_FAILED]: false,
+};
 
 /**
- * A structured error object returned by the server.
- * Provides richer error information than standard JSON-RPC errors.
+ * Structured error information for JSON-RPC error `data` field
+ * or the `mcp.error` async method.
  */
 export interface StructuredError {
-  /**
-   * Stable, machine-readable error identifier.
-   * Examples: "TOOL_AUTH_REQUIRED", "TOOL_NOT_FOUND", "RATE_LIMITED".
-   */
+  /** Stable error code identifier (see ErrorCode for standard codes). */
   code: string;
 
-  /** Whether the operation may succeed if retried. */
+  /** Whether retrying the operation may succeed. */
   retryable?: boolean;
 
-  /** Suggested delay before retrying (format TBD — likely milliseconds). */
+  /** Suggested delay before retrying, in milliseconds. */
   retry_after?: number;
 
   /** Implementation-specific error context. */
@@ -577,27 +704,76 @@ export interface StructuredError {
 }
 
 /**
- * Well-known error codes proposed for the structured error model.
- * (Not yet standardized in the spec — proposed here for reference.)
+ * Parameters for the `mcp.error` async notification method.
  */
-export const ErrorCodes = {
-  TOOL_NOT_FOUND: "TOOL_NOT_FOUND",
-  INVALID_ARGUMENTS: "INVALID_ARGUMENTS",
-  AUTH_REQUIRED: "AUTH_REQUIRED",
-  TOKEN_EXPIRED: "TOKEN_EXPIRED",
-  RATE_LIMITED: "RATE_LIMITED",
-  TIMEOUT: "TIMEOUT",
-  INTERNAL_ERROR: "INTERNAL_ERROR",
-  PLAN_VALIDATION_ERROR: "PLAN_VALIDATION_ERROR",
-  APPROVAL_DENIED: "APPROVAL_DENIED",
-} as const;
+export interface McpErrorParams {
+  /** The original request ID that triggered the error. */
+  request_id: string;
+
+  /** Stable error code identifier. */
+  code: string;
+
+  /** Whether retrying the operation may succeed. */
+  retryable?: boolean;
+
+  /** Suggested delay before retrying, in milliseconds. */
+  retry_after?: number;
+
+  /** Implementation-specific error context. */
+  details?: Record<string, unknown>;
+}
 
 // ============================================================================
-// 7. JSON-RPC Wrappers
+// 6. Tool Metadata
 // ============================================================================
 
 /**
- * Minimal JSON-RPC request shape (the parts relevant to mcp-e).
+ * Execution metadata for a tool.
+ * Exposed as part of the tool definition (e.g., in `tools/list` response).
+ */
+export interface ToolMetadata {
+  /** Whether the tool has external side effects (writes, sends, mutates). */
+  side_effects?: boolean;
+
+  /** Whether the tool is idempotent (safe to retry without side effects). */
+  idempotent?: boolean;
+
+  /** Whether human confirmation is recommended before execution. */
+  requires_confirmation?: boolean;
+
+  /** Expected execution timeout in milliseconds. */
+  timeout_ms?: number;
+
+  /** Rate limit hint: max calls per second. */
+  rate_limit?: number;
+
+  /** Cost estimate per invocation (arbitrary unit, implementation-defined). */
+  cost_estimate?: number;
+}
+
+// ============================================================================
+// Standard Error Codes
+// ============================================================================
+
+/** Standard error codes recognised by mcp-e implementations. */
+export enum StandardErrorCode {
+  TOOL_NOT_FOUND = "TOOL_NOT_FOUND",
+  INVALID_ARGUMENTS = "INVALID_ARGUMENTS",
+  AUTH_REQUIRED = "AUTH_REQUIRED",
+  TOKEN_EXPIRED = "TOKEN_EXPIRED",
+  RATE_LIMITED = "RATE_LIMITED",
+  TIMEOUT = "TIMEOUT",
+  INTERNAL_ERROR = "INTERNAL_ERROR",
+  APPROVAL_DENIED = "APPROVAL_DENIED",
+  PLAN_VALIDATION_FAILED = "PLAN_VALIDATION_FAILED",
+}
+
+// ============================================================================
+// JSON-RPC Base Types
+// ============================================================================
+
+/**
+ * A JSON-RPC request object.
  */
 export interface JsonRpcRequest<TParams = unknown> {
   jsonrpc: "2.0";
@@ -607,7 +783,7 @@ export interface JsonRpcRequest<TParams = unknown> {
 }
 
 /**
- * Minimal JSON-RPC success response shape.
+ * A successful JSON-RPC response.
  */
 export interface JsonRpcSuccessResponse<TResult = unknown> {
   jsonrpc: "2.0";
@@ -616,7 +792,8 @@ export interface JsonRpcSuccessResponse<TResult = unknown> {
 }
 
 /**
- * Minimal JSON-RPC error response shape with optional structured error data.
+ * A JSON-RPC error response.
+ * Structured error information sits in the `data` field.
  */
 export interface JsonRpcErrorResponse<TData = StructuredError> {
   jsonrpc: "2.0";
@@ -628,7 +805,20 @@ export interface JsonRpcErrorResponse<TData = StructuredError> {
   };
 }
 
-/** Union type for JSON-RPC responses. */
-export type JsonRpcResponse<TResult = unknown, TData = StructuredError> =
-  | JsonRpcSuccessResponse<TResult>
-  | JsonRpcErrorResponse<TData>;
+// ============================================================================
+// Expression Language
+// ============================================================================
+
+/**
+ * Standard expression language identifiers.
+ */
+export enum ExpressionLanguage {
+  /** Common Expression Language (default) — mandatory for plan-supporting servers. */
+  CEL = "cel",
+
+  /** JSONata query/expression language — opt-in. */
+  JSONATA = "jsonata",
+
+  /** Sandboxed JavaScript — optional, requires isolation guarantees. */
+  SANDBOX = "sandbox",
+}

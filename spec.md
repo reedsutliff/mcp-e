@@ -127,11 +127,58 @@ Example:
     "plans",
     "subscriptions",
     "resumable"
+  ],
+
+  "expression_languages": [
+    "cel"
   ]
 }
 ```
 
+Servers that support the `"plans"` extension MUST support CEL (`"cel"`) as an expression
+language. Servers MAY additionally advertise `"sandbox"` to indicate support for inline
+sandboxed JavaScript expressions.
+
+Users of JSONata MAY negotiate it as an alternate expression language (see Section 3).
+
 ---
+
+## 2a. Expression Language Support
+
+### 2a.1 CEL (Default)
+
+All servers that advertise `"plans"` in their extensions MUST support
+[Common Expression Language (CEL)](https://github.com/google/cel-spec) as the default
+expression language. Condition expressions (`if`), variable references, and foreach
+collection paths SHALL be evaluated using CEL unless another language is negotiated.
+
+### 2a.2 JSONata (Opt-in)
+
+Servers MAY also support JSONata as an expression language. Clients that prefer
+JSONata SHALL indicate this during negotiation (Section 3). If a server does not
+support the requested expression language, the client MUST fall back to CEL.
+
+### 2a.3 Sandbox (Optional)
+
+Servers MAY advertise `"sandbox"` as an expression type. When sandbox is active,
+condition expressions and inline operations MAY contain small, sandboxed JavaScript
+snippets executed in an isolated environment. The sandbox environment exposes
+a predefined set of variables:
+
+| Variable            | Description                                  |
+|---------------------|----------------------------------------------|
+| `plan.step[n]`      | Access step result by index                  |
+| `plan.step[id]`     | Access step result by step ID                |
+| `plan.variables`    | Named variables in the execution context     |
+| `plan.input`        | Original plan input parameters               |
+
+Implementations MUST enforce execution timeouts, recursion limits, and memory
+bounds on sandbox execution. The sandbox MUST NOT have access to: filesystem,
+network sockets, environment variables, or system processes.
+
+---
+
+
 
 ## 3. Negotiation
 
@@ -145,7 +192,9 @@ Clients MAY invoke:
   "params": {
     "versions": ["2026-01"],
     "encodings": ["jsonl"],
-    "compression": ["zstd"]
+    "compression": ["zstd"],
+    "extensions": ["plans", "subscriptions"],
+    "expression_language": "cel"
   }
 }
 ```
@@ -159,10 +208,31 @@ Servers respond:
   "result": {
     "version": "2025-03",
     "encoding": "jsonl",
-    "compression": "gzip"
+    "compression": "gzip",
+    "extensions": ["plans"],
+    "expression_language": "cel"
   }
 }
 ```
+
+### 3.1 Negotiation Parameters
+
+| Field               | Required | Description                                      |
+|---------------------|----------|--------------------------------------------------|
+| versions            | No       | Ordered list of supported MCP protocol versions  |
+| encodings           | No       | Ordered list of supported message encodings      |
+| compression         | No       | Ordered list of supported compression codecs     |
+| extensions          | No       | Requested extension identifiers to activate       |
+| expression_language | No       | Preferred expression language identifier         |
+
+### 3.2 Selection Semantics
+
+The server SHOULD select the highest mutually-supported value from each
+client-offered list. The server MUST NOT select a value the client did not offer.
+If no intersection exists for a field, the server SHOULD select a sensible default
+or omit the field from the result.
+
+### 3.3 Graceful Degradation
 
 Servers that do not support negotiation SHOULD return:
 
@@ -175,7 +245,16 @@ Servers that do not support negotiation SHOULD return:
 }
 ```
 
-Clients MUST gracefully fall back.
+Clients MUST gracefully fall back to the following defaults when negotiation
+is unavailable or fails:
+
+| Field               | Default    |
+|---------------------|------------|
+| version             | "2025-03"  |
+| encoding            | "json"     |
+| compression         | "none"     |
+| extensions          | []         |
+| expression_language | "cel"      |
 
 ---
 
@@ -249,12 +328,26 @@ Fields:
 
 ---
 
-### 5.3 Tool Invocation Step
+### 5.3 Step Structure
+
+Every step in a plan SHALL have a `kind` field that explicitly identifies the
+step type. This replaces reliance on implicit field presence.
+
+| Kind           | Step Type         | Section |
+|----------------|-------------------|---------|
+| `"tool_call"`  | Tool invocation   | 5.4     |
+| `"operation"`  | Regex, transform  | 5.6     |
+| `"foreach"`    | Fan-out iteration | 5.7     |
+| `"parallel"`   | Branch fan-out    | 5.9     |
+| `"conditional"`| If-then-else      | 5.8     |
+
+### 5.4 Tool Invocation Step
 
 Example:
 
 ```json
 {
+  "kind": "tool_call",
   "id": "fetch",
   "tool": "search",
   "arguments": {
@@ -267,6 +360,7 @@ Fields:
 
 | Field     | Required |
 |-----------|----------|
+| kind      | Yes      |
 | tool      | Yes      |
 | arguments | No       |
 | id        | No       |
@@ -297,7 +391,7 @@ Implementations SHOULD support JSONPath-like traversal.
 
 ---
 
-### 5.5 Regex Operation
+### 5.6 Regex Operation
 
 Plans MAY perform regex extraction.
 
@@ -305,6 +399,7 @@ Example:
 
 ```json
 {
+  "kind": "operation",
   "id": "extract",
   "operation": "regex",
   "input": "$fetch.result.text",
@@ -325,7 +420,7 @@ Output:
 
 ---
 
-### 5.6 Foreach
+### 5.7 Foreach
 
 Plans MAY fan out execution.
 
@@ -333,6 +428,7 @@ Example:
 
 ```json
 {
+  "kind": "foreach",
   "foreach": "$extract.matches",
   "as": "id",
   "parallelism": 5,
@@ -356,12 +452,13 @@ Behavior:
 
 ---
 
-### 5.7 Conditional Execution
+### 5.8 Conditional Execution
 
 Example:
 
 ```json
 {
+  "kind": "conditional",
   "if": "$search.count > 0",
 
   "then": [
@@ -378,18 +475,21 @@ Example:
 }
 ```
 
-Condition syntax SHOULD be deterministic and side-effect free.
-
-Implementations MUST NOT require arbitrary scripting languages.
+Condition expressions SHALL use the negotiated expression language (CEL by
+default; see Sections 2a and 3). The expression MUST be deterministic and
+side-effect free. Implementations MUST NOT require arbitrary scripting languages
+unless the `"sandbox"` expression language has been negotiated, in which case
+sandbox restrictions (Section 2a.3) SHALL apply.
 
 ---
 
-### 5.8 Parallel Execution
+### 5.9 Parallel Execution
 
 Example:
 
 ```json
 {
+  "kind": "parallel",
   "parallel": [
     [
       {
@@ -413,7 +513,7 @@ Behavior:
 
 ---
 
-### 5.9 Retry Policy
+### 5.10 Retry Policy
 
 Tool invocations MAY specify retry behavior.
 
@@ -421,8 +521,8 @@ Example:
 
 ```json
 {
+  "kind": "tool_call",
   "tool": "fetch",
-
   "retry": {
     "attempts": 3,
     "backoff": "exponential"
@@ -437,14 +537,14 @@ Supported backoff values:
 
 ---
 
-### 5.10 Error Handling
+### 5.11 Error Handling
 
 Example:
 
 ```json
 {
+  "kind": "tool_call",
   "tool": "lookup",
-
   "on_error": "continue"
 }
 ```
@@ -461,7 +561,7 @@ Default: `fail`
 
 ---
 
-### 5.11 Human Approval
+### 5.12 Human Approval
 
 Execution MAY pause awaiting approval.
 
@@ -476,6 +576,74 @@ Example:
 ```
 
 Executors SHOULD expose an approval mechanism appropriate to their environment.
+
+#### 5.12.1 Approval Response
+
+When an approval gate is triggered, the executor SHALL suspend plan execution
+and surface the approval request. A human or policy mechanism responds via
+the `mcp.approve` and `mcp.deny` JSON-RPC methods:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "mcp.approve",
+  "params": {
+    "plan_id": "plan-abc-123",
+    "step_id": "email-batch",
+    "authorized_by": "human"
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "mcp.deny",
+  "params": {
+    "plan_id": "plan-abc-123",
+    "step_id": "email-batch",
+    "authorized_by": "human",
+    "reason": "Too many emails"
+  }
+}
+```
+
+#### 5.12.2 Authorized By
+
+The `authorized_by` field SHALL indicate the source of the approval decision:
+
+| Value     | Meaning                                                   |
+|-----------|-----------------------------------------------------------|
+| `"human"` | Explicit human consent (click, confirm, voice)            |
+| `"policy"`| Automated rule or policy (e.g., "auto-approve < 10 items")|
+| `"yolo"`  | Pre-configured blanket approval mode on the client        |
+
+Implementations MAY define additional `authorized_by` values.
+
+#### 5.12.3 Timeout
+
+Implementations SHOULD support an optional `timeout` field on the approval block.
+If no approval response is received within the timeout window, the executor SHALL
+treat it as a denial and fail the step unless `on_error` specifies otherwise.
+
+```json
+{
+  "approval": {
+    "message": "Send 37 emails?",
+    "timeout_ms": 300000
+  }
+}
+```
+
+#### 5.12.4 Rejection Handling
+
+If a human denies approval:
+
+- The step SHALL fail with error code `APPROVAL_DENIED`.
+- If `on_error` is set on the step, it SHALL be honoured (e.g., `on_error: "continue"` skips the step).
+- If no `on_error` is set, the default (`fail`) SHALL abort the plan.
 
 ---
 
@@ -513,26 +681,74 @@ Additional fields MAY be defined.
 
 Implementations MAY provide structured error information.
 
-Example:
+### 7.1 Inline (Request-Response)
+
+For JSON-RPC request-response flows, structured errors SHOULD be placed in the
+`data` field of a standard JSON-RPC error object:
 
 ```json
 {
+  "jsonrpc": "2.0",
+  "id": 1,
   "error": {
+    "code": -32000,
+    "message": "Tool execution failed",
+    "data": {
+      "code": "TOOL_AUTH_REQUIRED",
+      "retryable": true,
+      "details": {}
+    }
+  }
+}
+```
+
+### 7.2 Async (Streaming / Notifications)
+
+For streaming or asynchronous error delivery, implementations MAY use the
+`mcp.error` JSON-RPC method to deliver structured errors out-of-band:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "mcp.error",
+  "params": {
+    "request_id": "req-42",
     "code": "TOOL_AUTH_REQUIRED",
     "retryable": true,
+    "retry_after": 5000,
     "details": {}
   }
 }
 ```
 
-Suggested fields:
+### 7.3 Error Fields
+
+Suggested fields:|
 
 | Field       | Description                              |
 |-------------|------------------------------------------|
 | code        | Stable identifier                        |
-| retryable   | Whether retry is appropriate              |
-| retry_after | Suggested delay                          |
+| retryable   | Whether retry is appropriate             |
+| retry_after | Suggested delay in milliseconds          |
 | details     | Implementation-specific information       |
+
+### 7.4 Standard Error Codes
+
+The following error codes SHOULD be recognised:
+
+| Code                     | Description                    | Retryable |
+|--------------------------|--------------------------------|-----------|
+| `TOOL_NOT_FOUND`         | Referenced tool does not exist | false     |
+| `INVALID_ARGUMENTS`      | Tool arguments failed validation| false    |
+| `AUTH_REQUIRED`          | Authentication needed          | false     |
+| `TOKEN_EXPIRED`          | Bearer/oauth token expired     | true      |
+| `RATE_LIMITED`           | Server rate limit exceeded     | true      |
+| `TIMEOUT`                | Tool execution timed out       | true      |
+| `INTERNAL_ERROR`         | Unspecified server error       | false     |
+| `APPROVAL_DENIED`        | Human or policy denied approval| false     |
+| `PLAN_VALIDATION_FAILED` | Plan failed schema validation  | false     |
+
+Implementations MAY define additional error codes.
 
 ---
 

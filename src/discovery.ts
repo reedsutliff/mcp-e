@@ -12,7 +12,6 @@
 import type {
   McpDiscoveryDocument,
   McpCapabilitiesDocument,
-  JsonRpcResponse,
 } from "./types";
 
 // ============================================================================
@@ -324,6 +323,9 @@ export interface ExtendedServerCapabilities {
 
   /** Known extensions supported by the server. */
   extensions?: string[];
+
+  /** Expression languages advertised by the server. */
+  expressionLanguages?: string[];
 }
 
 /**
@@ -347,5 +349,6 @@ export function mergeDiscoveryIntoCapabilities(
     ...base,
     supportsPlans: discoveryResult.capabilities.extensions?.includes("plans"),
     extensions: discoveryResult.capabilities.extensions,
+    expressionLanguages: discoveryResult.capabilities.expression_languages,
   };
 }

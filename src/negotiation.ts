@@ -21,6 +21,8 @@ const DEFAULT_NEGOTIATION: NegotiateResult = {
   version: "2025-03",
   encoding: "json",
   compression: "none",
+  extensions: [],
+  expression_language: "cel",
 };
 
 // ============================================================================
@@ -209,6 +211,12 @@ export interface NegotiateHandlerOptions {
   /** Compression codecs the server supports. */
   supportedCompression: string[];
 
+  /** Extension identifiers the server supports (e.g., "plans", "subscriptions"). */
+  supportedExtensions?: string[];
+
+  /** Expression languages the server supports (e.g., "cel", "jsonata", "sandbox"). */
+  supportedExpressionLanguages?: string[];
+
   /**
    * Selection strategy for picking from the client's offers.
    * - "prefer-first": pick the first matching value from each list
@@ -225,7 +233,7 @@ export interface NegotiateHandlerOptions {
 export type SelectionFunction = (
   clientOffers: string[] | undefined,
   serverSupports: string[],
-  category: "version" | "encoding" | "compression"
+  category: "version" | "encoding" | "compression" | "extension" | "expression_language"
 ) => string | null;
 
 /**
@@ -290,6 +298,18 @@ export class NegotiateHandler {
       "compression"
     );
 
+    // Extensions: compute intersection, return all matches
+    const extensions = this.selectExtensions(
+      params.extensions,
+      this.options.supportedExtensions ?? []
+    );
+
+    // Expression language: single selection with CEL fallback
+    const expressionLanguage = this.selectExpressionLanguage(
+      params.expression_language,
+      this.options.supportedExpressionLanguages ?? ["cel"]
+    );
+
     // If any required selection fails, return an error
     if (!version || !encoding || !compression) {
       return {
@@ -312,8 +332,40 @@ export class NegotiateHandler {
 
     return {
       success: true,
-      result: { version, encoding, compression },
+      result: { version, encoding, compression, extensions, expression_language: expressionLanguage },
     };
+  }
+
+  /**
+   * Select active extensions from client request.
+   * Returns the intersection of requested and supported extensions.
+   */
+  private selectExtensions(
+    clientExtensions: string[] | undefined,
+    serverExtensions: string[]
+  ): string[] {
+    if (!clientExtensions || clientExtensions.length === 0) {
+      return [];
+    }
+    const serverSet = new Set(serverExtensions);
+    return clientExtensions.filter((e) => serverSet.has(e));
+  }
+
+  /**
+   * Select expression language.
+   * Client's preference wins if supported; otherwise CEL.
+   */
+  private selectExpressionLanguage(
+    clientLanguage: string | undefined,
+    serverLanguages: string[]
+  ): string {
+    if (clientLanguage && serverLanguages.includes(clientLanguage)) {
+      return clientLanguage;
+    }
+    // Fall back to CEL if available
+    if (serverLanguages.includes("cel")) return "cel";
+    // Otherwise first supported
+    return serverLanguages[0] ?? "cel";
   }
 
   /**
